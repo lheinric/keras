@@ -200,7 +200,7 @@ class VarianceScaling(Initializer):
             scale /= max(1., float(fan_in + fan_out) / 2)
         if self.distribution == 'normal':
             stddev = np.sqrt(scale)
-            return K.truncated_normal(shape, 0., stddev,
+            return K.random_normal(shape, 0., stddev,
                                       dtype=dtype, seed=self.seed)
         else:
             limit = np.sqrt(3. * scale)
