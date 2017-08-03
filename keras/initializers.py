@@ -370,6 +370,12 @@ def he_normal(seed=None):
                            distribution='normal',
                            seed=seed)
 
+def he_normal_transposed(seed=None):
+    return VarianceScaling(scale=2.,
+                           mode='fan_out',
+                           distribution='normal',
+                           seed=seed)
+
 
 def lecun_normal(seed=None):
     """LeCun normal initializer.
