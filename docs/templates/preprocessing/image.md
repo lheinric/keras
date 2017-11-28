@@ -38,7 +38,11 @@ Generate batches of tensor image data with real-time data augmentation. The data
     - __shear_range__: Float. Shear Intensity (Shear angle in counter-clockwise direction as radians)
     - __zoom_range__: Float or [lower, upper]. Range for random zoom. If a float, `[lower, upper] = [1-zoom_range, 1+zoom_range]`.
     - __channel_shift_range__: Float. Range for random channel shifts.
-    - __fill_mode__: One of {"constant", "nearest", "reflect" or "wrap"}.  Points outside the boundaries of the input are filled according to the given mode.
+    - __fill_mode__: One of {"constant", "nearest", "reflect" or "wrap"}.  Points outside the boundaries of the input are filled according to the given mode:
+        * "constant": `kkkkkkkk|abcd|kkkkkkkk` (`cval=k`)
+        * "nearest":  `aaaaaaaa|abcd|dddddddd`
+        * "reflect":  `abcddcba|abcd|dcbaabcd`
+        * "wrap":     `abcdabcd|abcd|abcdabcd`
     - __cval__: Float or Int. Value used for points outside the boundaries when `fill_mode = "constant"`.
     - __horizontal_flip__: Boolean. Randomly flip inputs horizontally.
     - __vertical_flip__: Boolean. Randomly flip inputs vertically.
@@ -86,7 +90,7 @@ Generate batches of tensor image data with real-time data augmentation. The data
     - __flow_from_directory(directory)__: Takes the path to a directory, and generates batches of augmented/normalized data. Yields batches indefinitely, in an infinite loop.
         - __Arguments__:
             - __directory__: path to the target directory. It should contain one subdirectory per class.
-                Any PNG, JPG or BMP images inside each of the subdirectories directory tree will be included in the generator.
+                Any PNG, JPG, BMP or PPM images inside each of the subdirectories directory tree will be included in the generator.
                 See [this script](https://gist.github.com/fchollet/0830affa1f7f19fd47b06d4cf89ed44d) for more details.
             - __target_size__: tuple of integers `(height, width)`, default: `(256, 256)`. 
                 The dimensions to which all images found will be resized.

@@ -1,6 +1,6 @@
 '''Visualization of the filters of VGG16, via gradient ascent in input space.
 
-This script can run on CPU in a few minutes (with the TensorFlow backend).
+This script can run on CPU in a few minutes.
 
 Results example: http://i.imgur.com/4nj4KjN.jpg
 '''
@@ -59,7 +59,7 @@ def normalize(x):
 
 
 kept_filters = []
-for filter_index in range(0, 200):
+for filter_index in range(200):
     # we only scan through the first 200 filters,
     # but there are actually 512 of them
     print('Processing filter %d' % filter_index)

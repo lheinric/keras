@@ -13,10 +13,12 @@ from . import backend as K
 from . import optimizers
 from . import layers as layer_module
 from .utils.io_utils import ask_to_proceed_with_overwrite
+from .utils.generic_utils import has_arg
 from .engine.training import Model
 from .engine import topology
 from .engine.topology import Layer
 from .engine.topology import Input
+from .engine.topology import InputLayer
 from .legacy import layers as legacy_layers
 from .legacy import models as legacy_models
 from .legacy import interfaces
@@ -149,8 +151,11 @@ def save_model(model, filepath, overwrite=True, include_optimizer=True):
                         # Default values of symbolic_weights is /variable
                         # for theano and cntk
                         if K.backend() == 'theano' or K.backend() == 'cntk':
-                            if hasattr(w, 'name') and w.name != "/variable":
-                                name = str(w.name)
+                            if hasattr(w, 'name'):
+                                if w.name.split('/')[-1] == 'variable':
+                                    name = str(w.name) + '_' + str(i)
+                                else:
+                                    name = str(w.name)
                             else:
                                 name = 'param_' + str(i)
                         else:
@@ -421,37 +426,50 @@ class Sequential(Model):
                             'an instance of class Layer. '
                             'Found: ' + str(layer))
         if not self.outputs:
-            # first layer in model: check that it is an input layer
-            if not layer.inbound_nodes:
-                # create an input layer
-                if not hasattr(layer, 'batch_input_shape'):
-                    raise ValueError('The first layer in a '
-                                     'Sequential model must '
-                                     'get an `input_shape` or '
-                                     '`batch_input_shape` argument.')
+            # First layer in model: check that it is an input layer.
+            if not isinstance(layer, (InputLayer, legacy_layers.Merge)):
+                # Create an input layer.
+                # First, we need to infer its expected input shape and dtype.
+                if isinstance(layer, (Model, Sequential)):
+                    # We were passed a model as first layer.
+                    # This requires a specific way to figure out the
+                    # input shape and dtype.
+                    if not layer.layers:
+                        raise ValueError('Cannot add an empty model '
+                                         'to a `Sequential` model.')
+                    # In case of nested models: recover the first layer
+                    # of the deepest model to infer input shape and dtype.
+                    first_layer = layer.layers[0]
+                    while isinstance(first_layer, (Model, Sequential)):
+                        first_layer = first_layer.layers[0]
+                    batch_shape = first_layer.batch_input_shape
+                    dtype = first_layer.dtype
+                else:
+                    # We were passed a regular layer, and it should
+                    # know about its input shape. Otherwise, that's an error.
+                    if not hasattr(layer, 'batch_input_shape'):
+                        raise ValueError('The first layer in a '
+                                         'Sequential model must '
+                                         'get an `input_shape` or '
+                                         '`batch_input_shape` argument.')
+                    batch_shape = layer.batch_input_shape
+                    dtype = layer.dtype
                 # Instantiate the input layer.
-                x = Input(batch_shape=layer.batch_input_shape,
-                          dtype=layer.dtype, name=layer.name + '_input')
+                x = Input(batch_shape=batch_shape,
+                          dtype=dtype,
+                          name=layer.name + '_input')
                 # This will build the current layer
                 # and create the node connecting the current layer
                 # to the input layer we just created.
                 layer(x)
 
-            if len(layer.inbound_nodes) != 1:
-                raise ValueError('A layer added to a Sequential model must '
-                                 'not already be connected somewhere else. '
-                                 'Model received layer ' + layer.name +
-                                 ' which has ' +
-                                 str(len(layer.inbound_nodes)) +
-                                 ' pre-existing inbound connections.')
-
-            if len(layer.inbound_nodes[0].output_tensors) != 1:
+            if len(layer.inbound_nodes[-1].output_tensors) != 1:
                 raise ValueError('All layers in a Sequential model '
                                  'should have a single output tensor. '
                                  'For multi-output layers, '
                                  'use the functional API.')
 
-            self.outputs = [layer.inbound_nodes[0].output_tensors[0]]
+            self.outputs = [layer.inbound_nodes[-1].output_tensors[0]]
             self.inputs = topology.get_source_inputs(self.outputs[0])
 
             # We create an input node, which we will keep updated
@@ -557,7 +575,6 @@ class Sequential(Model):
         # Make sure child model callbacks
         # will call the parent Sequential model.
         self.model.callback_model = self
-
         self.built = True
 
     @property
@@ -659,12 +676,6 @@ class Sequential(Model):
             self.build()
         return self.model.regularizers
 
-    @property
-    def constraints(self):
-        if not self.built:
-            self.build()
-        return self.model.constraints
-
     def get_weights(self):
         """Retrieves the weights of the model.
 
@@ -745,24 +756,49 @@ class Sequential(Model):
     def compile(self, optimizer, loss,
                 metrics=None,
                 sample_weight_mode=None,
+                weighted_metrics=None,
+                target_tensors=None,
                 **kwargs):
-        """Configures the learning process.
+        """Configures the model for training.
 
         # Arguments
-            optimizer: str (name of optimizer) or optimizer object.
+            optimizer: String (name of optimizer) or optimizer object.
                 See [optimizers](/optimizers).
-            loss: str (name of objective function) or objective function.
+            loss: String (name of objective function) or objective function.
                 See [losses](/losses).
-            metrics: list of metrics to be evaluated by the model
+                If the model has multiple outputs, you can use a different loss
+                on each output by passing a dictionary or a list of losses.
+                The loss value that will be minimized by the model
+                will then be the sum of all individual losses.
+            metrics: List of metrics to be evaluated by the model
                 during training and testing.
                 Typically you will use `metrics=['accuracy']`.
-                See [metrics](/metrics).
-            sample_weight_mode: if you need to do timestep-wise
-                sample weighting (2D weights), set this to "temporal".
-                "None" defaults to sample-wise weights (1D).
-            **kwargs: for Theano/CNTK backends, these are passed into
-                K.function. When using the TensorFlow backend, these are
-                passed into `tf.Session.run`.
+                To specify different metrics for different outputs of a
+                multi-output model, you could also pass a dictionary,
+                such as `metrics={'output_a': 'accuracy'}`.
+            sample_weight_mode: If you need to do timestep-wise
+                sample weighting (2D weights), set this to `"temporal"`.
+                `None` defaults to sample-wise weights (1D).
+                If the model has multiple outputs, you can use a different
+                `sample_weight_mode` on each output by passing a
+                dictionary or a list of modes.
+            weighted_metrics: List of metrics to be evaluated and weighted
+                by sample_weight or class_weight during training and testing.
+            target_tensors: By default, Keras will create a placeholder for the
+                model's target, which will be fed with the target data during
+                training. If instead you would like to use your own
+                target tensor (in turn, Keras will not expect external
+                Numpy data for these targets at training time), you
+                can specify them via the `target_tensors` argument.
+                It should be a single tensor
+                (for a single-output `Sequential` model).
+            **kwargs: When using the Theano/CNTK backends, these arguments
+                are passed into `K.function`.
+                When using the TensorFlow backend,
+                these arguments are passed into `tf.Session.run`.
+
+        # Raises
+            ValueError: In case of invalid arguments for
 
         # Example
             ```python
@@ -780,57 +816,112 @@ class Sequential(Model):
         self.model.compile(optimizer, loss,
                            metrics=metrics,
                            sample_weight_mode=sample_weight_mode,
+                           weighted_metrics=weighted_metrics,
+                           target_tensors=target_tensors,
                            **kwargs)
         self.optimizer = self.model.optimizer
         self.loss = self.model.loss
-        self.total_loss = self.model.total_loss
-        self.loss_weights = self.model.loss_weights
         self.metrics = self.model.metrics
+        self.loss_weights = self.model.loss_weights
+        self.sample_weight_mode = self.model.sample_weight_mode
+        self.weighted_metrics = self.model.weighted_metrics
+        self.targets = self.model.targets
         self.metrics_tensors = self.model.metrics_tensors
         self.metrics_names = self.model.metrics_names
-        self.sample_weight_mode = self.model.sample_weight_mode
         self.sample_weights = self.model.sample_weights
-        self.targets = self.model.targets
+        self.total_loss = self.model.total_loss
 
-    def fit(self, x, y, batch_size=32, epochs=10, verbose=1, callbacks=None,
-            validation_split=0., validation_data=None, shuffle=True,
-            class_weight=None, sample_weight=None, initial_epoch=0, **kwargs):
-        """Trains the model for a fixed number of epochs.
+    def fit(self,
+            x=None,
+            y=None,
+            batch_size=None,
+            epochs=1,
+            verbose=1,
+            callbacks=None,
+            validation_split=0.,
+            validation_data=None,
+            shuffle=True,
+            class_weight=None,
+            sample_weight=None,
+            initial_epoch=0,
+            steps_per_epoch=None,
+            validation_steps=None,
+            **kwargs):
+        """Trains the model for a fixed number of epochs (iterations on a dataset).
 
         # Arguments
-            x: input data, as a Numpy array or list of Numpy arrays
-                (if the model has multiple inputs).
-            y: labels, as a Numpy array.
-            batch_size: integer. Number of samples per gradient update.
-            epochs: integer, the number of epochs to train the model.
-            verbose: 0 for no logging to stdout,
-                1 for progress bar logging, 2 for one log line per epoch.
-            callbacks: list of `keras.callbacks.Callback` instances.
+            x: Numpy array of training data.
+                If the input layer in the model is named, you can also pass a
+                dictionary mapping the input name to a Numpy array.
+                `x` can be `None` (default) if feeding from
+                framework-native tensors (e.g. TensorFlow data tensors).
+            y: Numpy array of target (label) data.
+                If the output layer in the model is named, you can also pass a
+                dictionary mapping the output name to a Numpy array.
+                `y` can be `None` (default) if feeding from
+                framework-native tensors (e.g. TensorFlow data tensors).
+            batch_size: Integer or `None`.
+                Number of samples per gradient update.
+                If unspecified, it will default to 32.
+            epochs: Integer. Number of epochs to train the model.
+                An epoch is an iteration over the entire `x` and `y`
+                data provided.
+                Note that in conjunction with `initial_epoch`,
+                `epochs` is to be understood as "final epoch".
+                The model is not trained for a number of iterations
+                given by `epochs`, but merely until the epoch
+                of index `epochs` is reached.
+            verbose: 0, 1, or 2. Verbosity mode.
+                0 = silent, 1 = progress bar, 2 = one line per epoch.
+            callbacks: List of `keras.callbacks.Callback` instances.
                 List of callbacks to apply during training.
                 See [callbacks](/callbacks).
-            validation_split: float (0. < x < 1).
-                Fraction of the data to use as held-out validation data.
-            validation_data: tuple (x_val, y_val) or tuple
-                (x_val, y_val, val_sample_weights) to be used as held-out
-                validation data. Will override validation_split.
-            shuffle: boolean or str (for 'batch').
-                Whether to shuffle the samples at each epoch.
+            validation_split: Float between 0 and 1.
+                Fraction of the training data to be used as validation data.
+                The model will set apart this fraction of the training data,
+                will not train on it, and will evaluate
+                the loss and any model metrics
+                on this data at the end of each epoch.
+                The validation data is selected from the last samples
+                in the `x` and `y` data provided, before shuffling.
+            validation_data: tuple `(x_val, y_val)` or tuple
+                `(x_val, y_val, val_sample_weights)` on which to evaluate
+                the loss and any model metrics at the end of each epoch.
+                The model will not be trained on this data.
+                This will override `validation_split`.
+            shuffle: Boolean (whether to shuffle the training data
+                before each epoch) or str (for 'batch').
                 'batch' is a special option for dealing with the
                 limitations of HDF5 data; it shuffles in batch-sized chunks.
-            class_weight: dictionary mapping classes to a weight value,
-                used for scaling the loss function (during training only).
-            sample_weight: Numpy array of weights for
-                the training samples, used for scaling the loss function
+                Has no effect when `steps_per_epoch` is not `None`.
+            class_weight: Optional dictionary mapping class indices (integers)
+                to a weight (float) value, used for weighting the loss function
+                (during training only).
+                This can be useful to tell the model to
+                "pay more attention" to samples from
+                an under-represented class.
+            sample_weight: Optional Numpy array of weights for
+                the training samples, used for weighting the loss function
                 (during training only). You can either pass a flat (1D)
                 Numpy array with the same length as the input samples
                 (1:1 mapping between weights and samples),
                 or in the case of temporal data,
-                you can pass a 2D array with shape (samples, sequence_length),
+                you can pass a 2D array with shape
+                `(samples, sequence_length)`,
                 to apply a different weight to every timestep of every sample.
                 In this case you should make sure to specify
-                sample_weight_mode="temporal" in compile().
-            initial_epoch: epoch at which to start training
-                (useful for resuming a previous training run)
+                `sample_weight_mode="temporal"` in `compile()`.
+            initial_epoch: Epoch at which to start training
+                (useful for resuming a previous training run).
+            steps_per_epoch: Total number of steps (batches of samples)
+                before declaring one epoch finished and starting the
+                next epoch. When training with input tensors such as
+                TensorFlow data tensors, the default `None` is equal to
+                the number of samples in your dataset divided by
+                the batch size, or 1 if that cannot be determined.
+            validation_steps: Only relevant if `steps_per_epoch`
+                is specified. Total number of steps (batches of samples)
+                to validate before stopping.
 
         # Returns
             A `History` object. Its `History.history` attribute is
@@ -839,7 +930,9 @@ class Sequential(Model):
             and validation metrics values (if applicable).
 
         # Raises
-            RuntimeError: if the model was never compiled.
+            RuntimeError: If the model was never compiled.
+            ValueError: In case of mismatch between the provided input data
+                and what the model expects.
         """
         # Legacy support
         if 'nb_epoch' in kwargs:
@@ -862,7 +955,9 @@ class Sequential(Model):
                               shuffle=shuffle,
                               class_weight=class_weight,
                               sample_weight=sample_weight,
-                              initial_epoch=initial_epoch)
+                              initial_epoch=initial_epoch,
+                              steps_per_epoch=steps_per_epoch,
+                              validation_steps=validation_steps)
 
     def evaluate(self, x, y, batch_size=32, verbose=1,
                  sample_weight=None):
@@ -977,7 +1072,7 @@ class Sequential(Model):
         return self.model.test_on_batch(x, y,
                                         sample_weight=sample_weight)
 
-    def predict_proba(self, x, batch_size=32, verbose=1):
+    def predict_proba(self, x, batch_size=32, verbose=0):
         """Generates class probability predictions for the input samples.
 
         The input samples are processed batch by batch.
@@ -999,7 +1094,7 @@ class Sequential(Model):
                           '(like softmax or sigmoid would).')
         return preds
 
-    def predict_classes(self, x, batch_size=32, verbose=1):
+    def predict_classes(self, x, batch_size=32, verbose=0):
         """Generate class predictions for the input samples.
 
         The input samples are processed batch by batch.
@@ -1021,7 +1116,7 @@ class Sequential(Model):
 
     @interfaces.legacy_generator_methods_support
     def fit_generator(self, generator,
-                      steps_per_epoch,
+                      steps_per_epoch=None,
                       epochs=1,
                       verbose=1,
                       callbacks=None,
@@ -1031,6 +1126,7 @@ class Sequential(Model):
                       max_queue_size=10,
                       workers=1,
                       use_multiprocessing=False,
+                      shuffle=True,
                       initial_epoch=0):
         """Fits the model on data generated batch-by-batch by a Python generator.
 
@@ -1050,9 +1146,15 @@ class Sequential(Model):
             steps_per_epoch: Total number of steps (batches of samples)
                 to yield from `generator` before declaring one epoch
                 finished and starting the next epoch. It should typically
-                be equal to the number of unique samples of your dataset
+                be equal to the number of samples of your dataset
                 divided by the batch size.
+                Optional for `Sequence`: if unspecified, will use
+                the `len(generator)` as a number of steps.
             epochs: Integer, total number of iterations on the data.
+                Note that in conjunction with initial_epoch, the parameter
+                epochs is to be understood as "final epoch". The model is
+                not trained for n steps given by epochs, but until the
+                epoch epochs is reached.
             verbose: Verbosity mode, 0, 1, or 2.
             callbacks: List of callbacks to be called during training.
             validation_data: This can be either
@@ -1063,8 +1165,10 @@ class Sequential(Model):
                 is a generator.
                 Number of steps to yield from validation generator
                 at the end of every epoch. It should typically
-                be equal to the number of unique samples of your
+                be equal to the number of samples of your
                 validation dataset divided by the batch size.
+                Optional for `Sequence`: if unspecified, will use
+                the `len(validation_data)` as a number of steps.
             class_weight: Dictionary mapping class indices to a weight
                 for the class.
             max_queue_size: Maximum size for the generator queue
@@ -1076,8 +1180,11 @@ class Sequential(Model):
                 non picklable arguments to the generator
                 as they can't be passed
                 easily to children processes.
+            shuffle: Whether to shuffle the order of the batches at
+                the beginning of each epoch. Only used with instances
+                of `Sequence` (keras.utils.Sequence).
             initial_epoch: Epoch at which to start training
-                (useful for resuming a previous training run)
+                (useful for resuming a previous training run).
 
         # Returns
             A `History` object.
@@ -1096,7 +1203,7 @@ class Sequential(Model):
                         # and labels, from each line in the file
                         x, y = process_line(line)
                         yield (x, y)
-                        f.close()
+                    f.close()
 
             model.fit_generator(generate_arrays_from_file('/my_file.txt'),
                                 steps_per_epoch=1000, epochs=10)
@@ -1116,10 +1223,11 @@ class Sequential(Model):
                                         max_queue_size=max_queue_size,
                                         workers=workers,
                                         use_multiprocessing=use_multiprocessing,
+                                        shuffle=shuffle,
                                         initial_epoch=initial_epoch)
 
     @interfaces.legacy_generator_methods_support
-    def evaluate_generator(self, generator, steps,
+    def evaluate_generator(self, generator, steps=None,
                            max_queue_size=10, workers=1,
                            use_multiprocessing=False):
         """Evaluates the model on a data generator.
@@ -1132,6 +1240,8 @@ class Sequential(Model):
                 or (inputs, targets, sample_weights)
             steps: Total number of steps (batches of samples)
                 to yield from `generator` before stopping.
+                Optional for `Sequence`: if unspecified, will use
+                the `len(generator)` as a number of steps.
             max_queue_size: maximum size for the generator queue
             workers: maximum number of processes to spin up
             use_multiprocessing: if True, use process based threading.
@@ -1159,7 +1269,7 @@ class Sequential(Model):
                                              use_multiprocessing=use_multiprocessing)
 
     @interfaces.legacy_generator_methods_support
-    def predict_generator(self, generator, steps,
+    def predict_generator(self, generator, steps=None,
                           max_queue_size=10, workers=1,
                           use_multiprocessing=False, verbose=0):
         """Generates predictions for the input samples from a data generator.
@@ -1171,6 +1281,8 @@ class Sequential(Model):
             generator: generator yielding batches of input samples.
             steps: Total number of steps (batches of samples)
                 to yield from `generator` before stopping.
+                Optional for `Sequence`: if unspecified, will use
+                the `len(generator)` as a number of steps.
             max_queue_size: maximum size for the generator queue
             workers: maximum number of processes to spin up
             use_multiprocessing: if True, use process based threading.
@@ -1291,3 +1403,231 @@ class Sequential(Model):
             layer = get_or_create_layer(conf)
             model.add(layer)
         return model
+
+
+def _clone_functional_model(model, input_tensors=None):
+    """Clone a functional `Model` instance.
+
+    Model cloning is similar to calling a model on new inputs,
+    except that it creates new layers (and thus new weights) instead
+    of sharing the weights of the existing layers.
+
+    # Arguments
+        model: Instance of `Model`.
+        input_tensors: optional list of input tensors
+            to build the model upon. If not provided,
+            placeholders will be created.
+
+    # Returns
+        An instance of `Model` reproducing the behavior
+        of the original model, on top of new inputs tensors,
+        using newly instantiated weights.
+
+    # Raises
+        ValueError: in case of invalid `model` argument value.
+    """
+    if not isinstance(model, Model):
+        raise ValueError('Expected `model` argument '
+                         'to be a `Model` instance, got ', model)
+    if isinstance(model, Sequential):
+        raise ValueError('Expected `model` argument '
+                         'to be a functional `Model` instance, '
+                         'got a `Sequential` instance instead:', model)
+
+    layer_map = {}  # Cache for created layers.
+    tensor_map = {}  # Map {reference_tensor: (corresponding_tensor, mask)}
+    if input_tensors is None:
+        # Create placeholders to build the model on top of.
+        input_layers = []
+        input_tensors = []
+        for layer in model.input_layers:
+            input_tensor = Input(batch_shape=layer.batch_input_shape,
+                                 dtype=layer.dtype,
+                                 sparse=layer.sparse,
+                                 name=layer.name)
+            input_tensors.append(input_tensor)
+            # Cache newly created input layer.
+            newly_created_input_layer = input_tensor._keras_history[0]
+            layer_map[layer] = newly_created_input_layer
+        for original_input_layer, cloned_input_layer in zip(model.input_layers, input_layers):
+            layer_map[original_input_layer] = cloned_input_layer
+    else:
+        # Make sure that all input tensors come from a Keras layer.
+        # If tensor comes from an input layer: cache the input layer.
+        input_tensors = topology._to_list(input_tensors)
+        _input_tensors = []
+        for i, x in enumerate(input_tensors):
+            if not K.is_keras_tensor(x):
+                name = model.input_layers[i].name
+                input_tensor = Input(tensor=x,
+                                     name='input_wrapper_for_' + name)
+                _input_tensors.append(input_tensor)
+                # Cache newly created input layer.
+                original_input_layer = x._keras_history[0]
+                newly_created_input_layer = input_tensor._keras_history[0]
+                layer_map[original_input_layer] = newly_created_input_layer
+            else:
+                _input_tensors.append(x)
+        input_tensors = _input_tensors
+
+    for x, y in zip(model.inputs, input_tensors):
+        tensor_map[x] = (y, None)  # tensor, mask
+
+    # Iterated over every node in the reference model, in depth order.
+    depth_keys = list(model.nodes_by_depth.keys())
+    depth_keys.sort(reverse=True)
+    for depth in depth_keys:
+        nodes = model.nodes_by_depth[depth]
+        for node in nodes:
+            # Recover the corresponding layer.
+            layer = node.outbound_layer
+
+            # Get or create layer.
+            if layer not in layer_map:
+                # Clone layer.
+                new_layer = layer.__class__.from_config(layer.get_config())
+                layer_map[layer] = new_layer
+                layer = new_layer
+            else:
+                # Reuse previously cloned layer.
+                layer = layer_map[layer]
+                # Don't call InputLayer multiple times.
+                if isinstance(layer, topology.InputLayer):
+                    continue
+
+            # Gather inputs to call the new layer.
+            reference_input_tensors = node.input_tensors
+            reference_output_tensors = node.output_tensors
+
+            # If all previous input tensors are available in tensor_map,
+            # then call node.inbound_layer on them.
+            computed_data = []  # List of tuples (input, mask).
+            for x in reference_input_tensors:
+                if x in tensor_map:
+                    computed_data.append(tensor_map[x])
+
+            if len(computed_data) == len(reference_input_tensors):
+                # Call layer.
+                if node.arguments:
+                    kwargs = node.arguments
+                else:
+                    kwargs = {}
+                if len(computed_data) == 1:
+                    computed_tensor, computed_mask = computed_data[0]
+                    if has_arg(layer.call, 'mask'):
+                        if 'mask' not in kwargs:
+                            kwargs['mask'] = computed_mask
+                    output_tensors = topology._to_list(
+                        layer(computed_tensor, **kwargs))
+                    output_masks = topology._to_list(
+                        layer.compute_mask(computed_tensor,
+                                           computed_mask))
+                    computed_tensors = [computed_tensor]
+                    computed_masks = [computed_mask]
+                else:
+                    computed_tensors = [x[0] for x in computed_data]
+                    computed_masks = [x[1] for x in computed_data]
+                    if has_arg(layer.call, 'mask'):
+                        if 'mask' not in kwargs:
+                            kwargs['mask'] = computed_masks
+                    output_tensors = topology._to_list(
+                        layer(computed_tensors, **kwargs))
+                    output_masks = topology._to_list(
+                        layer.compute_mask(computed_tensors,
+                                           computed_masks))
+                # Update tensor_map.
+                for x, y, mask in zip(reference_output_tensors,
+                                      output_tensors,
+                                      output_masks):
+                    tensor_map[x] = (y, mask)
+
+    # Check that we did compute the model outputs,
+    # then instantiate a new model from inputs and outputs.
+    output_tensors = []
+    for x in model.outputs:
+        assert x in tensor_map, 'Could not compute output ' + str(x)
+        tensor, _ = tensor_map[x]
+        output_tensors.append(tensor)
+    return Model(input_tensors, output_tensors, name=model.name)
+
+
+def _clone_sequential_model(model, input_tensors=None):
+    """Clone a `Sequential` model instance.
+
+    Model cloning is similar to calling a model on new inputs,
+    except that it creates new layers (and thus new weights) instead
+    of sharing the weights of the existing layers.
+
+    # Arguments
+        model: Instance of `Sequential`.
+        input_tensors: optional list of input tensors
+            to build the model upon. If not provided,
+            placeholders will be created.
+
+    # Returns
+        An instance of `Sequential` reproducing the behavior
+        of the original model, on top of new inputs tensors,
+        using newly instantiated weights.
+
+    # Raises
+        ValueError: in case of invalid `model` argument value.
+    """
+    if not isinstance(model, Sequential):
+        raise ValueError('Expected `model` argument '
+                         'to be a `Sequential` model instance, '
+                         'but got:', model)
+
+    def clone(layer):
+        return layer.__class__.from_config(layer.get_config())
+
+    layers = [clone(layer) for layer in model.layers]
+    if input_tensors is None:
+        return Sequential(layers=layers, name=model.name)
+    else:
+        if len(topology._to_list(input_tensors)) != 1:
+            raise ValueError('To clone a `Sequential` model, we expect '
+                             ' at most one tensor '
+                             'as part of `input_tensors`.')
+        x = topology._to_list(input_tensors)[0]
+        if K.is_keras_tensor(x):
+            origin_layer = x._keras_history[0]
+            if isinstance(origin_layer, topology.InputLayer):
+                return Sequential(layers=[origin_layer] + layers,
+                                  name=model.name)
+            else:
+                raise ValueError('Cannot clone a `Sequential` model on top '
+                                 'of a tensor that comes from a Keras layer '
+                                 'other than an `InputLayer`. '
+                                 'Use the functional API instead.')
+        input_tensor = Input(tensor=x,
+                             name='input_wrapper_for_' + str(x.name))
+        input_layer = input_tensor._keras_history[0]
+        return Sequential(layers=[input_layer] + layers, name=model.name)
+
+
+def clone_model(model, input_tensors=None):
+    """Clone any `Model` instance.
+
+    Model cloning is similar to calling a model on new inputs,
+    except that it creates new layers (and thus new weights) instead
+    of sharing the weights of the existing layers.
+
+    # Arguments
+        model: Instance of `Model`
+            (could be a functional model or a Sequential model).
+        input_tensors: optional list of input tensors
+            to build the model upon. If not provided,
+            placeholders will be created.
+
+    # Returns
+        An instance of `Model` reproducing the behavior
+        of the original model, on top of new inputs tensors,
+        using newly instantiated weights.
+
+    # Raises
+        ValueError: in case of invalid `model` argument value.
+    """
+    if isinstance(model, Sequential):
+        return _clone_sequential_model(model, input_tensors=input_tensors)
+    else:
+        return _clone_functional_model(model, input_tensors=input_tensors)

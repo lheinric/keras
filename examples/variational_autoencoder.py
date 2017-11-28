@@ -1,6 +1,9 @@
 '''This script demonstrates how to build a variational autoencoder with Keras.
 
-Reference: "Auto-Encoding Variational Bayes" https://arxiv.org/abs/1312.6114
+ #Reference
+
+ - Auto-Encoding Variational Bayes
+   https://arxiv.org/abs/1312.6114
 '''
 import numpy as np
 import matplotlib.pyplot as plt
@@ -20,7 +23,7 @@ epochs = 50
 epsilon_std = 1.0
 
 
-x = Input(batch_shape=(batch_size, original_dim))
+x = Input(shape=(original_dim,))
 h = Dense(intermediate_dim, activation='relu')(x)
 z_mean = Dense(latent_dim)(h)
 z_log_var = Dense(latent_dim)(h)
@@ -28,7 +31,7 @@ z_log_var = Dense(latent_dim)(h)
 
 def sampling(args):
     z_mean, z_log_var = args
-    epsilon = K.random_normal(shape=(batch_size, latent_dim), mean=0.,
+    epsilon = K.random_normal(shape=(K.shape(z_mean)[0], latent_dim), mean=0.,
                               stddev=epsilon_std)
     return z_mean + K.exp(z_log_var / 2) * epsilon
 
@@ -78,7 +81,7 @@ vae.fit(x_train,
         shuffle=True,
         epochs=epochs,
         batch_size=batch_size,
-        validation_data=(x_test, x_test))
+        validation_data=(x_test, None))
 
 # build a model to project inputs on the latent space
 encoder = Model(x, z_mean)
